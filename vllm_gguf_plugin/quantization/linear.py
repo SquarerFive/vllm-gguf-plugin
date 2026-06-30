@@ -54,6 +54,13 @@ def _fused_mul_mat_gguf(
     else:
         qweight_type = WeightType(qweight_type)
         raise NotImplementedError(f"Unsupported GGUF quantization type: {qweight_type}")
+    # The CUDA quantized GEMM kernels (ggml_mul_mat_a8 / ggml_mul_mat_vec_a8)
+    # accumulate in float32 and return float32.  Downstream fused kernels
+    # (e.g. CUTLASS-DSL indexer Q+RoPE+quant) expect bfloat16 to match the
+    # model dtype.  Match the input dtype so the rest of the graph sees
+    # consistent precision.
+    if y.dtype != x.dtype:
+        y = y.to(x.dtype)
     return y
 
 
