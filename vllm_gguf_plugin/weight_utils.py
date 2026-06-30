@@ -108,6 +108,7 @@ def gguf_quant_weights_iterator_multi(
     are skipped and names are translated accordingly.
     """
     _QUANT_TYPES = ("F32", "BF16", "F16")
+    _INT_TYPES = ("I8", "I16", "I32", "I64")
 
     for gguf_file in gguf_files:
         reader = gguf.GGUFReader(gguf_file)
@@ -120,9 +121,9 @@ def gguf_quant_weights_iterator_multi(
                 name = tensor.name
 
             weight_type = tensor.tensor_type
-            if weight_type.name not in _QUANT_TYPES:
-                yield name.replace("weight", "qweight_type"), torch.tensor(weight_type)
-                name = name.replace("weight", "qweight")
+            if weight_type.name not in _QUANT_TYPES and weight_type.name not in _INT_TYPES:
+                yield name.replace(".weight", ".qweight_type"), torch.tensor(weight_type)
+                name = name.replace(".weight", ".qweight")
 
             weight = tensor.data
             if weight_type.name == "BF16" and weight.dtype == np.uint8:
