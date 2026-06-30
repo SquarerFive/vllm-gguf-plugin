@@ -63,9 +63,12 @@ class GGUFConfig(QuantizationConfig):
 
     @classmethod
     def override_quantization_method(
-        cls, hf_quant_cfg: dict[str, Any], user_quant: str | None
+        cls,
+        hf_quant_cfg: dict[str, Any],
+        user_quant: str | None,
+        hf_config: Any = None,
     ) -> "QuantizationMethods | None":
-        del hf_quant_cfg
+        del hf_quant_cfg, hf_config
         if user_quant == "gguf":
             return "gguf"
         return None

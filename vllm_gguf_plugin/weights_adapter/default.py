@@ -29,6 +29,202 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _resolve_gguf_model_type(
+    model_type: str,
+    aliases: tuple[str, ...],
+) -> str:
+    supported_model_types = set(gguf.MODEL_ARCH_NAMES.values())
+    for alias in aliases:
+        if alias in supported_model_types:
+            return alias
+    return model_type
+
+
+def _normalize_deepseek_v4_config(config: "PretrainedConfig") -> None:
+    if config.model_type not in ("deepseek_v4", "deepseek_v4_flash"):
+        return
+
+    missing = object()
+
+    def get_attr(obj: "PretrainedConfig", attr: str):
+        try:
+            return getattr(obj, attr)
+        except AttributeError:
+            return missing
+
+    def ensure(obj: "PretrainedConfig", attr: str, value) -> None:
+        current = get_attr(obj, attr)
+        if current is missing or (current is None and value is not None):
+            obj.update({attr: value})
+
+    scalar_defaults = {
+        "vocab_size": 129280,
+        "hidden_size": 4096,
+        "moe_intermediate_size": 2048,
+        "num_hidden_layers": 43,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 1,
+        "head_dim": 512,
+        "q_lora_rank": 1024,
+        "num_experts_per_tok": 6,
+        "n_routed_experts": 256,
+        "n_shared_experts": 1,
+        "scoring_func": "sqrtsoftplus",
+        "norm_topk_prob": True,
+        "routed_scaling_factor": 1.5,
+        "max_position_embeddings": 1048576,
+        "rope_theta": 10000.0,
+        "hc_mult": 4,
+        "hc_sinkhorn_iters": 20,
+        "hc_eps": 1.0e-6,
+        "swiglu_limit": 10.0,
+        "sliding_window": 128,
+        "o_groups": 8,
+        "o_lora_rank": 1024,
+        "index_n_heads": 64,
+        "index_head_dim": 128,
+        "index_topk": 512,
+        "num_nextn_predict_layers": 1,
+        "output_router_logits": False,
+        "router_aux_loss_coef": 0.001,
+        "router_jitter_noise": 0.0,
+        "hidden_act": "silu",
+        "initializer_range": 0.02,
+        "rms_norm_eps": 1.0e-6,
+        "use_cache": True,
+        "pad_token_id": None,
+        "bos_token_id": 0,
+        "eos_token_id": 1,
+        "tie_word_embeddings": False,
+        "attention_bias": False,
+        "mlp_bias": False,
+        "attention_dropout": 0.0,
+    }
+    for attr, value in scalar_defaults.items():
+        ensure(config, attr, value)
+    ensure(config, "intermediate_size", config.moe_intermediate_size)
+    ensure(config, "num_local_experts", config.n_routed_experts)
+
+    compress_rope_theta = get_attr(config, "compress_rope_theta")
+    if compress_rope_theta is missing or compress_rope_theta is None:
+        config.update({"compress_rope_theta": 160000.0})
+
+    partial_rotary_factor = get_attr(config, "partial_rotary_factor")
+    if partial_rotary_factor is missing or partial_rotary_factor is None:
+        qk_rope_head_dim = get_attr(config, "qk_rope_head_dim")
+        partial_rotary_factor = (
+            qk_rope_head_dim / config.head_dim
+            if qk_rope_head_dim is not missing and qk_rope_head_dim is not None
+            else 64 / 512
+        )
+        config.update({"partial_rotary_factor": partial_rotary_factor})
+
+    n_layers = config.num_hidden_layers
+    compress_rates = get_attr(config, "compress_rates")
+    if compress_rates is missing or compress_rates is None:
+        compress_rates = {
+            "compressed_sparse_attention": 4,
+            "heavily_compressed_attention": 128,
+        }
+    else:
+        compress_rates = dict(compress_rates)
+    legacy_compress_rate_csa = get_attr(config, "compress_rate_csa")
+    if (
+        legacy_compress_rate_csa is not missing
+        and legacy_compress_rate_csa is not None
+    ):
+        compress_rates["compressed_sparse_attention"] = legacy_compress_rate_csa
+    legacy_compress_rate_hca = get_attr(config, "compress_rate_hca")
+    if (
+        legacy_compress_rate_hca is not missing
+        and legacy_compress_rate_hca is not None
+    ):
+        compress_rates["heavily_compressed_attention"] = legacy_compress_rate_hca
+    config.update({"compress_rates": compress_rates})
+
+    compress_ratio_to_layer_type = {
+        0: "sliding_attention",
+        4: "compressed_sparse_attention",
+        128: "heavily_compressed_attention",
+    }
+    layer_types = get_attr(config, "layer_types")
+    if layer_types is missing or layer_types is None:
+        legacy_compress_ratios = get_attr(config, "compress_ratios")
+        if (
+            legacy_compress_ratios is not missing
+            and legacy_compress_ratios is not None
+        ):
+            layer_types = [
+                compress_ratio_to_layer_type[r] for r in legacy_compress_ratios
+            ]
+        else:
+            layer_types = ["heavily_compressed_attention"] * min(n_layers, 2) + [
+                "compressed_sparse_attention"
+                if i % 2
+                else "heavily_compressed_attention"
+                for i in range(max(n_layers - 2, 0))
+            ]
+    config.update({"layer_types": list(layer_types[:n_layers])})
+
+    mlp_layer_types = get_attr(config, "mlp_layer_types")
+    if mlp_layer_types is missing or mlp_layer_types is None:
+        legacy_num_hash_layers = get_attr(config, "num_hash_layers")
+        n_hash = (
+            legacy_num_hash_layers
+            if (
+                legacy_num_hash_layers is not missing
+                and legacy_num_hash_layers is not None
+            )
+            else 3
+        )
+        mlp_layer_types = ["hash_moe"] * min(n_layers, n_hash) + [
+            "moe" for _ in range(max(n_layers - n_hash, 0))
+        ]
+    config.update({"mlp_layer_types": list(mlp_layer_types[:n_layers])})
+
+    ensure(
+        config,
+        "qk_rope_head_dim",
+        int(config.head_dim * config.partial_rotary_factor),
+    )
+    rope_parameters = get_attr(config, "rope_parameters")
+    if rope_parameters is missing or rope_parameters is None:
+        rope_parameters = {}
+    if (
+        isinstance(rope_parameters.get("main"), dict)
+        and isinstance(rope_parameters.get("compress"), dict)
+    ):
+        rope_parameters = {
+            "main": rope_parameters["main"],
+            "compress": rope_parameters["compress"],
+        }
+    else:
+        yarn = {
+            k: v
+            for k, v in rope_parameters.items()
+            if k not in ("main", "compress")
+        }
+        main = {
+            "rope_type": "default",
+            "rope_theta": config.rope_theta,
+            "partial_rotary_factor": config.partial_rotary_factor,
+        }
+        compress = {
+            **yarn,
+            "rope_theta": config.compress_rope_theta,
+            "partial_rotary_factor": config.partial_rotary_factor,
+        }
+        compress.setdefault("rope_type", "default")
+        if compress["rope_type"] == "yarn":
+            compress.setdefault("attention_factor", 1.0)
+        rope_parameters = {"main": main, "compress": compress}
+    config.update({"rope_parameters": rope_parameters})
+
+    text_config = config.get_text_config()
+    if text_config is not config:
+        _normalize_deepseek_v4_config(text_config)
+
+
 class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
     """Default adapter for GGUF models."""
 
@@ -40,7 +236,10 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
         return True
 
     def patch_hf_config(self, model_path: str, hf_config: PretrainedConfig):
-        return maybe_patch_hf_config_from_gguf(model_path, hf_config)
+        _normalize_deepseek_v4_config(hf_config)
+        hf_config = maybe_patch_hf_config_from_gguf(model_path, hf_config)
+        _normalize_deepseek_v4_config(hf_config)
+        return hf_config
 
     def build_name_map(self, model_config: ModelConfig) -> dict[str, str]:
         config = model_config.hf_config
@@ -79,25 +278,141 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
                     )
                 )
         if model_type in ("deepseek_v4", "deepseek_v4_flash"):
-            model_type = "deepseek4"
+            model_type = _resolve_gguf_model_type(
+                model_type,
+                ("deepseek4", "deepseek2"),
+            )
+            gguf_to_hf_name_map["output_hc_fn.weight"] = "model.hc_head_fn"
+            gguf_to_hf_name_map["output_hc_base.weight"] = "model.hc_head_base"
+            gguf_to_hf_name_map["output_hc_scale.weight"] = "model.hc_head_scale"
+            sideload_params.extend(
+                regex.compile(pattern)
+                for pattern in (
+                    r"model\.hc_head\.(hc_fn|hc_base|hc_scale)",
+                    r"model\.layers\.[0-9]+\.self_attn\."
+                    r"(q_a_norm|kv_proj|kv_norm|o_a_proj|o_b_proj)\.weight",
+                    r"model\.layers\.[0-9]+\.self_attn\.compressor\."
+                    r"(position_bias|kv_proj\.weight|gate_proj\.weight|"
+                    r"kv_norm\.weight)",
+                    r"model\.layers\.[0-9]+\.self_attn\.compressor\.indexer\."
+                    r"(position_bias|kv_proj\.weight|gate_proj\.weight|"
+                    r"kv_norm\.weight|q_b_proj\.weight|"
+                    r"scorer\.weights_proj\.weight)",
+                    r"model\.layers\.[0-9]+\.mlp\.gate\."
+                    r"(tid2eid|e_score_correction_bias)",
+                    r"model\.layers\.[0-9]+\.mlp\.experts\."
+                    r"(gate_up_proj|down_proj)",
+                    r"model\.layers\.[0-9]+\.mlp\.shared_experts\."
+                    r"(gate_proj|up_proj|down_proj)\.weight",
+                    r"model\.layers\.[0-9]+\.(attn_hc|ffn_hc)\."
+                    r"(fn|base|scale)",
+                )
+            )
             for idx in range(config.num_hidden_layers):
+                gguf_to_hf_name_map[f"blk.{idx}.attn_norm.weight"] = (
+                    f"model.layers.{idx}.attn_norm.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.attn_sinks.weight"] = (
+                    f"model.layers.{idx}.attn.attn_sink"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.attn_q_a.weight"] = (
+                    f"model.layers.{idx}.attn.wq_a.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.attn_q_b.weight"] = (
+                    f"model.layers.{idx}.attn.wq_b.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.attn_q_a_norm.weight"] = (
+                    f"model.layers.{idx}.attn.q_norm.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.attn_kv.weight"] = (
+                    f"model.layers.{idx}.attn.wkv.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.attn_kv_a_norm.weight"] = (
+                    f"model.layers.{idx}.attn.kv_norm.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.attn_output_a.weight"] = (
+                    f"model.layers.{idx}.attn.wo_a.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.attn_output_b.weight"] = (
+                    f"model.layers.{idx}.attn.wo_b.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.hc_attn_fn.weight"] = (
+                    f"model.layers.{idx}.hc_attn_fn"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.hc_attn_base.weight"] = (
+                    f"model.layers.{idx}.hc_attn_base"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.hc_attn_scale.weight"] = (
+                    f"model.layers.{idx}.hc_attn_scale"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.hc_ffn_fn.weight"] = (
+                    f"model.layers.{idx}.hc_ffn_fn"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.hc_ffn_base.weight"] = (
+                    f"model.layers.{idx}.hc_ffn_base"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.hc_ffn_scale.weight"] = (
+                    f"model.layers.{idx}.hc_ffn_scale"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.attn_compressor_ape.weight"] = (
+                    f"model.layers.{idx}.attn.compressor.ape"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.attn_compressor_kv.weight"] = (
+                    f"model.layers.{idx}.attn.compressor.wkv.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.attn_compressor_gate.weight"] = (
+                    f"model.layers.{idx}.attn.compressor.wgate.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.attn_compressor_norm.weight"] = (
+                    f"model.layers.{idx}.attn.compressor.norm.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.indexer_compressor_ape.weight"] = (
+                    f"model.layers.{idx}.attn.indexer.compressor.ape"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.indexer_compressor_kv.weight"] = (
+                    f"model.layers.{idx}.attn.indexer.compressor.wkv.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.indexer_compressor_gate.weight"] = (
+                    f"model.layers.{idx}.attn.indexer.compressor.wgate.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.indexer_compressor_norm.weight"] = (
+                    f"model.layers.{idx}.attn.indexer.compressor.norm.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.indexer.attn_q_b.weight"] = (
+                    f"model.layers.{idx}.attn.indexer.wq_b.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.indexer.proj.weight"] = (
+                    f"model.layers.{idx}.attn.indexer.weights_proj.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_tid2eid.weight"] = (
+                    f"model.layers.{idx}.ffn.gate.tid2eid"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_inp.weight"] = (
+                    f"model.layers.{idx}.ffn.gate.weight"
+                )
                 gguf_to_hf_name_map[f"blk.{idx}.exp_probs_b.bias"] = (
-                    f"model.layers.{idx}.mlp.gate.e_score_correction_bias"
+                    f"model.layers.{idx}.ffn.gate.e_score_correction_bias"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_norm.weight"] = (
+                    f"model.layers.{idx}.ffn_norm.weight"
                 )
                 gguf_to_hf_name_map[f"blk.{idx}.ffn_down_exps.weight"] = (
-                    f"model.layers.{idx}.mlp.experts.0.down_proj.weight"
+                    f"model.layers.{idx}.ffn.experts.0.w2.weight"
                 )
                 gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_exps.weight"] = (
-                    f"model.layers.{idx}.mlp.experts.0.gate_proj.weight"
+                    f"model.layers.{idx}.ffn.experts.0.w1.weight"
                 )
                 gguf_to_hf_name_map[f"blk.{idx}.ffn_up_exps.weight"] = (
-                    f"model.layers.{idx}.mlp.experts.0.up_proj.weight"
+                    f"model.layers.{idx}.ffn.experts.0.w3.weight"
                 )
-                sideload_params.append(
-                    regex.compile(
-                        f"model\\.layers\\.{idx}"
-                        r"\.mlp\.experts\.[0-9]+\.(gate|up|down)_proj\.weight"
-                    )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_gate_shexp.weight"] = (
+                    f"model.layers.{idx}.ffn.shared_experts.w1.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_down_shexp.weight"] = (
+                    f"model.layers.{idx}.ffn.shared_experts.w2.weight"
+                )
+                gguf_to_hf_name_map[f"blk.{idx}.ffn_up_shexp.weight"] = (
+                    f"model.layers.{idx}.ffn.shared_experts.w3.weight"
                 )
         if model_type in ("qwen2_moe", "qwen3_moe"):
             model_type = model_type.replace("_", "")

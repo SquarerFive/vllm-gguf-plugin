@@ -20,12 +20,17 @@ from vllm.transformers_utils.config import get_config_parser
 
 import vllm_gguf_plugin.config_parser as gguf_config_parser_module
 import vllm_gguf_plugin.quantization as gguf_quantization
+import vllm_gguf_plugin.weights_adapter.default as default_adapter_module
 from vllm_gguf_plugin import OOTGGUFConfig, OOTGGUFModelLoader, register
 from vllm_gguf_plugin.config_parser import GGUFConfigParser
 from vllm_gguf_plugin.quantization import (
     GGUFUninitializedParameter,
     GGUFWeightParameter,
     GGUFWeightTypeParameter,
+)
+from vllm_gguf_plugin.weights_adapter.default import (
+    _normalize_deepseek_v4_config,
+    _resolve_gguf_model_type,
 )
 
 
@@ -62,6 +67,67 @@ def test_oot_config_reuses_in_tree_behavior():
     assert isinstance(quant_config, OOTGGUFConfig)
     assert quant_config.get_name() == "gguf"
     assert repr(quant_config) == "GGUFConfig()"
+
+
+def test_resolve_gguf_model_type_prefers_first_supported_alias(monkeypatch):
+    monkeypatch.setattr(
+        default_adapter_module.gguf,
+        "MODEL_ARCH_NAMES",
+        {1: "deepseek2", 2: "deepseek4"},
+    )
+
+    assert (
+        _resolve_gguf_model_type("deepseek_v4", ("deepseek4", "deepseek2"))
+        == "deepseek4"
+    )
+
+
+def test_resolve_gguf_model_type_falls_back_to_compatible_alias(monkeypatch):
+    monkeypatch.setattr(
+        default_adapter_module.gguf,
+        "MODEL_ARCH_NAMES",
+        {1: "deepseek2"},
+    )
+
+    assert (
+        _resolve_gguf_model_type("deepseek_v4", ("deepseek4", "deepseek2"))
+        == "deepseek2"
+    )
+
+
+def test_normalize_deepseek_v4_config_adds_constructor_fields():
+    class ConfigProbe:
+        model_type = "deepseek_v4"
+        num_hidden_layers = 4
+        head_dim = 512
+        moe_intermediate_size = 1024
+        n_routed_experts = 32
+        rope_theta = 10000.0
+        compress_rope_theta = None
+        partial_rotary_factor = None
+        layer_types = None
+        mlp_layer_types = None
+        compress_rates = None
+        rope_parameters = None
+
+        def get_text_config(self):
+            return self
+
+        def update(self, values):
+            for key, value in values.items():
+                setattr(self, key, value)
+
+    config = ConfigProbe()
+
+    _normalize_deepseek_v4_config(config)
+
+    assert config.pad_token_id is None
+    assert config.intermediate_size == 1024
+    assert config.num_local_experts == 32
+    assert len(config.layer_types) == config.num_hidden_layers
+    assert len(config.mlp_layer_types) == config.num_hidden_layers
+    assert config.rope_parameters["main"]["rope_theta"] == config.rope_theta
+    assert config.rope_parameters["compress"]["rope_theta"] == 160000.0
 
 
 def test_gguf_linear_uses_weight_loader_v2(monkeypatch):
