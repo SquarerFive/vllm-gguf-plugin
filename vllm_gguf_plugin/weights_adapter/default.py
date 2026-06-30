@@ -548,8 +548,25 @@ class GGUFWeightsAdapter(BaseGGUFWeightsAdapter):
         for hf_name in state_dict:
             gguf_name_with_suffix = find_hf_name_in_tensor_map(hf_name)
             if gguf_name_with_suffix is not None:
-                gguf_to_hf_name_map[gguf_name_with_suffix] = hf_name
-                logger.debug("Mapped GGUF %s → HF %s", gguf_name_with_suffix, hf_name)
+                # Preserve hardcoded mappings (e.g., DeepSeek V4's
+                # blk.{idx}.attn_q_a.weight → model.layers.{idx}.attn.wq_a.weight
+                # which the model's stacked_params_mapping expects).
+                # Auto-mapping would override them with standard HF names
+                # (e.g., ...self_attn.q_a_proj.weight) that don't match.
+                if gguf_name_with_suffix not in gguf_to_hf_name_map:
+                    gguf_to_hf_name_map[gguf_name_with_suffix] = hf_name
+                    logger.debug(
+                        "Mapped GGUF %s → HF %s",
+                        gguf_name_with_suffix,
+                        hf_name,
+                    )
+                else:
+                    logger.debug(
+                        "Skipping GGUF %s → HF %s (already mapped to %s)",
+                        gguf_name_with_suffix,
+                        hf_name,
+                        gguf_to_hf_name_map[gguf_name_with_suffix],
+                    )
             elif hf_name not in gguf_to_hf_name_map.values():
                 unmapped_params.append(hf_name)
 
