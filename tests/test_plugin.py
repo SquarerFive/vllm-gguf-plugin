@@ -130,6 +130,48 @@ def test_normalize_deepseek_v4_config_adds_constructor_fields():
     assert config.rope_parameters["compress"]["rope_theta"] == 160000.0
 
 
+def test_normalize_deepseek_v4_config_flattens_rope_parameters():
+    class ConfigProbe:
+        model_type = "deepseek_v4"
+        num_hidden_layers = 1
+        head_dim = 512
+        moe_intermediate_size = 1024
+        n_routed_experts = 32
+        rope_theta = 10000.0
+        compress_rope_theta = 160000.0
+        partial_rotary_factor = 0.125
+        layer_types = ["heavily_compressed_attention"]
+        mlp_layer_types = ["hash_moe"]
+        compress_rates = {
+            "compressed_sparse_attention": 4,
+            "heavily_compressed_attention": 128,
+        }
+        rope_parameters = {
+            "main": {"rope_type": "default", "nested": {"drop": True}},
+            "compress": {
+                "type": "yarn",
+                "factor": 16,
+                "nested": {"drop": True},
+            },
+        }
+
+        def get_text_config(self):
+            return self
+
+        def update(self, values):
+            for key, value in values.items():
+                setattr(self, key, value)
+
+    config = ConfigProbe()
+
+    _normalize_deepseek_v4_config(config)
+
+    assert "nested" not in config.rope_parameters["main"]
+    assert "nested" not in config.rope_parameters["compress"]
+    assert config.rope_parameters["compress"]["rope_type"] == "yarn"
+    assert config.rope_parameters["compress"]["attention_factor"] == 1.0
+
+
 def test_gguf_linear_uses_weight_loader_v2(monkeypatch):
     register()
     monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)

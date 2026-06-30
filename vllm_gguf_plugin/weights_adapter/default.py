@@ -40,6 +40,19 @@ def _resolve_gguf_model_type(
     return model_type
 
 
+def _sanitize_deepseek_v4_rope_parameters(params: dict) -> dict:
+    sanitized = {}
+    for key, value in params.items():
+        if key in ("main", "compress"):
+            continue
+        if isinstance(value, dict):
+            continue
+        if isinstance(value, list) and any(isinstance(item, dict) for item in value):
+            continue
+        sanitized["rope_type" if key == "type" else key] = value
+    return sanitized
+
+
 def _normalize_deepseek_v4_config(config: "PretrainedConfig") -> None:
     if config.model_type not in ("deepseek_v4", "deepseek_v4_flash"):
         return
@@ -194,16 +207,24 @@ def _normalize_deepseek_v4_config(config: "PretrainedConfig") -> None:
         isinstance(rope_parameters.get("main"), dict)
         and isinstance(rope_parameters.get("compress"), dict)
     ):
+        main = _sanitize_deepseek_v4_rope_parameters(rope_parameters["main"])
+        compress = _sanitize_deepseek_v4_rope_parameters(
+            rope_parameters["compress"]
+        )
+        main.setdefault("rope_type", "default")
+        main["rope_theta"] = config.rope_theta
+        main["partial_rotary_factor"] = config.partial_rotary_factor
+        compress.setdefault("rope_type", "default")
+        compress["rope_theta"] = config.compress_rope_theta
+        compress["partial_rotary_factor"] = config.partial_rotary_factor
+        if compress["rope_type"] == "yarn":
+            compress.setdefault("attention_factor", 1.0)
         rope_parameters = {
-            "main": rope_parameters["main"],
-            "compress": rope_parameters["compress"],
+            "main": main,
+            "compress": compress,
         }
     else:
-        yarn = {
-            k: v
-            for k, v in rope_parameters.items()
-            if k not in ("main", "compress")
-        }
+        yarn = _sanitize_deepseek_v4_rope_parameters(rope_parameters)
         main = {
             "rope_type": "default",
             "rope_theta": config.rope_theta,
