@@ -90,6 +90,13 @@ _CUDA_GEMM_QUANT_TYPES = frozenset(
 )
 
 
+def _sm120_or_newer() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    major, _minor = torch.cuda.get_device_capability()
+    return major >= 12
+
+
 def _cuda_kernel_available(op_name: str, quant_type: int | None = None) -> bool:
     if not _CUDA_ENABLED:
         return False
@@ -103,6 +110,12 @@ def _cuda_kernel_available(op_name: str, quant_type: int | None = None) -> bool:
 
 def _cuda_gemm_kernel_available(op_name: str, quant_type: int) -> bool:
     return _cuda_kernel_available(op_name) and int(quant_type) in _CUDA_GEMM_QUANT_TYPES
+
+
+def _cuda_moe_kernel_available(op_name: str, quant_type: int) -> bool:
+    if _sm120_or_newer():
+        return False
+    return _cuda_kernel_available(op_name, quant_type)
 
 
 # --- Fake implementations for CUDA custom ops (needed for torch.compile) ---
@@ -221,7 +234,7 @@ def ggml_moe_a8(
     top_k: int,
     tokens: int,
 ) -> torch.Tensor:
-    if _cuda_gemm_kernel_available("ggml_moe_a8", quant_type):
+    if _cuda_moe_kernel_available("ggml_moe_a8", quant_type):
         return torch.ops._C_gguf.ggml_moe_a8(
             X,
             W,
@@ -255,7 +268,7 @@ def ggml_moe_a8_vec(
     row: int,
     tokens: int,
 ) -> torch.Tensor:
-    if _cuda_kernel_available("ggml_moe_a8_vec", quant_type):
+    if _cuda_moe_kernel_available("ggml_moe_a8_vec", quant_type):
         return torch.ops._C_gguf.ggml_moe_a8_vec(
             X, W, topk_ids, top_k, quant_type, row, tokens
         )
@@ -279,7 +292,7 @@ def ggml_moe_a8_vec(
 
 
 def ggml_moe_get_block_size(quant_type: int) -> int:
-    if _cuda_gemm_kernel_available("ggml_moe_get_block_size", quant_type):
+    if _cuda_moe_kernel_available("ggml_moe_get_block_size", quant_type):
         return torch.ops._C_gguf.ggml_moe_get_block_size(quant_type)
     return get_triton_moe_block_m(quant_type)
 
